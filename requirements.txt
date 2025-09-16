@@ -1,6 +1,40 @@
-fastapi
-uvicorn[standard]
-opencv-python
-numpy
+# Core Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+websockets>=12.0
+
+# Audio Processing
 pyaudio
-Pillow
+numpy>=1.21.0
+scipy>=1.7.0
+librosa>=0.9.0
+soundfile>=0.12.0
+webrtcvad>=2.0.0
+
+# AI/ML Libraries
+torch>=2.0.0
+torchaudio>=2.0.0
+silero-vad>=4.0
+openai-whisper>=20231117
+
+# Computer Vision
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# OCR and Text Processing
+pytesseract>=0.3.10
+easyocr>=1.7.0
+scikit-learn>=1.3.0
+fuzzywuzzy>=0.18.0
+python-Levenshtein>=0.21.0
+
+# Semantic Analysis and ML
+sentence-transformers>=2.2.0
+transformers>=4.30.0
+torch-audio>=2.0.0
+nltk>=3.8.0
+spacy>=3.6.0
+
+# Utilities
+python-multipart>=0.0.6
+aiofiles>=23.0.0
