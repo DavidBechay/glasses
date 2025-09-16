@@ -18,6 +18,9 @@ from fastapi.responses import HTMLResponse
 import threading
 import pyaudio
 import wave
+import hashlib
+from PIL import Image
+import io
 
 app = FastAPI(title="Smart Glasses - Best Document Detection")
 
@@ -28,6 +31,11 @@ document_detected = False
 auto_capture_enabled = True
 capture_count = 0
 last_capture_time = 0
+
+# Document fingerprinting system
+document_fingerprints = {}  # Store document hashes
+similarity_threshold = 0.85  # Similarity threshold (0-1)
+max_fingerprints = 50  # Maximum fingerprints to store
 
 # Audio settings
 audio_quality_levels = {
@@ -364,6 +372,14 @@ async def get_main_page():
                         <span>Confidence: </span>
                         <span id="confidence-level">--</span>
                     </div>
+                    <div style="margin: 10px 0;">
+                        <span>Duplicate Prevention: </span>
+                        <span style="color: #00ff00;">✅ Active</span>
+                    </div>
+                    <div style="margin: 10px 0;">
+                        <span>Similarity Threshold: </span>
+                        <span id="similarity-threshold">85%</span>
+                    </div>
                 </div>
                 
                 <!-- File Management -->
@@ -675,6 +691,144 @@ def get_camera_frame():
             return frame
     return current_frame
 
+def calculate_perceptual_hash(image):
+    """Calculate perceptual hash for image similarity detection"""
+    try:
+        # Resize to 8x8 for hash calculation
+        resized = cv2.resize(image, (8, 8))
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        
+        # Calculate average pixel value
+        avg = np.mean(gray)
+        
+        # Create hash based on pixels above/below average
+        hash_bits = []
+        for pixel in gray.flatten():
+            hash_bits.append('1' if pixel > avg else '0')
+        
+        # Convert to hexadecimal
+        hash_string = ''.join(hash_bits)
+        hash_int = int(hash_string, 2)
+        hash_hex = format(hash_int, '016x')
+        
+        return hash_hex
+    except Exception as e:
+        print(f"Hash calculation error: {e}")
+        return None
+
+def calculate_content_hash(image):
+    """Calculate content-based hash using document features"""
+    try:
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Extract text-like features
+        # 1. Edge density
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = np.sum(edges > 0) / (edges.shape[0] * edges.shape[1])
+        
+        # 2. Text line detection
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+        detected_lines = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, horizontal_kernel)
+        line_count = len(cv2.findContours(detected_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0])
+        
+        # 3. Average brightness
+        avg_brightness = np.mean(gray)
+        
+        # 4. Contrast (standard deviation)
+        contrast = np.std(gray)
+        
+        # Create content signature
+        content_signature = f"{edge_density:.3f}_{line_count}_{avg_brightness:.1f}_{contrast:.1f}"
+        
+        # Hash the signature
+        content_hash = hashlib.md5(content_signature.encode()).hexdigest()
+        
+        return content_hash, {
+            'edge_density': edge_density,
+            'line_count': line_count,
+            'brightness': avg_brightness,
+            'contrast': contrast
+        }
+    except Exception as e:
+        print(f"Content hash error: {e}")
+        return None, None
+
+def calculate_similarity(hash1, hash2):
+    """Calculate similarity between two perceptual hashes"""
+    if hash1 is None or hash2 is None:
+        return 0.0
+    
+    try:
+        # Convert hex to binary
+        bin1 = bin(int(hash1, 16))[2:].zfill(64)
+        bin2 = bin(int(hash2, 16))[2:].zfill(64)
+        
+        # Calculate Hamming distance
+        hamming_distance = sum(c1 != c2 for c1, c2 in zip(bin1, bin2))
+        
+        # Convert to similarity (0-1)
+        similarity = 1.0 - (hamming_distance / 64.0)
+        
+        return similarity
+    except Exception as e:
+        print(f"Similarity calculation error: {e}")
+        return 0.0
+
+def is_duplicate_document(image):
+    """Check if document is a duplicate of previously captured documents"""
+    global document_fingerprints
+    
+    try:
+        # Calculate hashes
+        perceptual_hash = calculate_perceptual_hash(image)
+        content_hash, content_features = calculate_content_hash(image)
+        
+        if perceptual_hash is None or content_hash is None:
+            return False, "Hash calculation failed"
+        
+        # Check against stored fingerprints
+        for stored_hash, stored_data in document_fingerprints.items():
+            # Compare perceptual hash
+            perceptual_similarity = calculate_similarity(perceptual_hash, stored_data['perceptual_hash'])
+            
+            # Compare content hash
+            content_similarity = 1.0 if content_hash == stored_data['content_hash'] else 0.0
+            
+            # Combined similarity (weighted)
+            combined_similarity = (perceptual_similarity * 0.7) + (content_similarity * 0.3)
+            
+            if combined_similarity > similarity_threshold:
+                print(f"Duplicate detected: similarity={combined_similarity:.3f}")
+                return True, f"Similar to {stored_data['filename']} (similarity: {combined_similarity:.3f})"
+        
+        # Store new fingerprint
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fingerprint_id = f"doc_{timestamp}"
+        
+        document_fingerprints[fingerprint_id] = {
+            'perceptual_hash': perceptual_hash,
+            'content_hash': content_hash,
+            'content_features': content_features,
+            'timestamp': time.time(),
+            'filename': f"document_{timestamp}.jpg"
+        }
+        
+        # Clean up old fingerprints if we have too many
+        if len(document_fingerprints) > max_fingerprints:
+            # Remove oldest fingerprints
+            sorted_fingerprints = sorted(document_fingerprints.items(), key=lambda x: x[1]['timestamp'])
+            for old_id, _ in sorted_fingerprints[:len(document_fingerprints) - max_fingerprints]:
+                del document_fingerprints[old_id]
+        
+        return False, "New document detected"
+        
+    except Exception as e:
+        print(f"Duplicate detection error: {e}")
+        return False, f"Error: {e}"
+
 def detect_document_advanced(frame):
     """Advanced document detection using multiple OpenCV methods"""
     try:
@@ -910,26 +1064,33 @@ async def document_detection():
                             except:
                                 pass
                     
-                    # Auto capture
+                    # Auto capture with duplicate detection
                     if detected and (time.time() - last_capture_time) >= 3.0:  # Increased delay
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        doc_file = DOCS_DIR / f"document_{timestamp}.jpg"
+                        # Check if this is a duplicate document
+                        is_duplicate, duplicate_reason = is_duplicate_document(frame)
                         
-                        cv2.imwrite(str(doc_file), frame)
-                        last_capture_time = time.time()
-                        capture_count += 1
-                        
-                        await send_log(f'📸 Document captured: {doc_file.name} (Confidence: {confidence:.2f})', 'success')
-                        
-                        # Notify all connections
-                        for connection in connections:
-                            try:
-                                await connection.send_json({
-                                    'type': 'auto_capture',
-                                    'filename': doc_file.name
-                                })
-                            except:
-                                pass
+                        if is_duplicate:
+                            await send_log(f'🚫 Duplicate document skipped: {duplicate_reason}', 'info')
+                            last_capture_time = time.time()  # Reset timer to prevent spam
+                        else:
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            doc_file = DOCS_DIR / f"document_{timestamp}.jpg"
+                            
+                            cv2.imwrite(str(doc_file), frame)
+                            last_capture_time = time.time()
+                            capture_count += 1
+                            
+                            await send_log(f'📸 Document captured: {doc_file.name} (Confidence: {confidence:.2f})', 'success')
+                            
+                            # Notify all connections
+                            for connection in connections:
+                                try:
+                                    await connection.send_json({
+                                        'type': 'auto_capture',
+                                        'filename': doc_file.name
+                                    })
+                                except:
+                                    pass
             
             await asyncio.sleep(0.5)
         except Exception as e:
@@ -950,10 +1111,11 @@ async def startup_event():
     
     print("🚀 All systems started automatically!")
     print("✅ Advanced OpenCV document detection active - No people detection")
+    print("🧠 Smart duplicate detection active - Won't capture same document twice")
 
 if __name__ == "__main__":
     print("🔬 Starting Smart Glasses - Best Document Detection...")
     print("📱 Open: http://localhost:8006")
-    print("🚀 Auto-start • 🎤 Voice detection • 📄 Advanced OpenCV Document detection")
+    print("🚀 Auto-start • 🎤 Voice detection • 📄 Smart Document detection • 🧠 Duplicate prevention")
     
     uvicorn.run(app, host="127.0.0.1", port=8006)
