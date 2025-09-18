@@ -16,13 +16,13 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import threading
-import pyaudio
-import wave
 import hashlib
 from PIL import Image
 import io
 import pytesseract
 import easyocr
+import sounddevice as sd
+import wave
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from fuzzywuzzy import fuzz
@@ -31,6 +31,8 @@ import sqlite3
 import json
 from sentence_transformers import SentenceTransformer
 import nltk
+import signal
+import sys
 nltk.download('punkt')
 nltk.download('stopwords')
 nltk.download('wordnet')
@@ -43,11 +45,83 @@ app = FastAPI(title="Smart Glasses - Best Document Detection")
 
 # Global state
 standby_mode = False
-voice_detected = False
 document_detected = False
 auto_capture_enabled = True
 capture_count = 0
 last_capture_time = 0
+
+# Audio recording settings
+AUDIO_CHANNELS = 1
+AUDIO_RATE = 44100
+AUDIO_FORMAT = 'int16'
+AUDIO_CHUNK_DURATION = 60 * 60  # 1 hour chunks
+
+class AudioRecorder:
+    def __init__(self):
+        self.recording = False
+        self.current_file = None
+        self.file_index = 1
+        self.recording_start_time = None
+        print("✅ Audio recorder initialized")
+    
+    def start_recording(self):
+        """Start continuous audio recording"""
+        if not self.recording:
+            self.recording = True
+            self.recording_start_time = time.time()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.current_file = str(AUDIO_DIR / f"recording_{timestamp}.wav")
+            
+            # Start recording in a separate thread
+            self.recording_thread = threading.Thread(target=self._record_chunk)
+            self.recording_thread.daemon = True
+            self.recording_thread.start()
+            
+            print(f"🎤 Audio recording started: {self.current_file}")
+    
+    def stop_recording(self):
+        """Stop audio recording"""
+        if self.recording:
+            self.recording = False
+            if hasattr(self, 'recording_thread'):
+                self.recording_thread.join(timeout=2)
+            
+            duration = time.time() - self.recording_start_time if self.recording_start_time else 0
+            print(f"🛑 Audio recording stopped. Duration: {duration:.1f}s")
+            return self.current_file, duration
+    
+    def _record_chunk(self):
+        """Record audio chunk using sounddevice"""
+        try:
+            wf = wave.open(self.current_file, 'wb')
+            wf.setnchannels(AUDIO_CHANNELS)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(AUDIO_RATE)
+
+            def callback(indata, frames_count, time_info, status):
+                if status:
+                    print(f"Audio status: {status}")
+                if self.recording:
+                    data = (indata * 32767).astype(np.int16).tobytes()
+                    wf.writeframes(data)
+
+            with sd.InputStream(samplerate=AUDIO_RATE, channels=AUDIO_CHANNELS, callback=callback):
+                print(f"🎤 Recording {self.current_file}...")
+                while self.recording:
+                    time.sleep(0.1)
+
+            wf.close()
+            print(f"💾 Saved {self.current_file}")
+            
+        except Exception as e:
+            print(f"❌ Audio recording error: {e}")
+    
+    def is_recording(self):
+        """Check if currently recording"""
+        return self.recording
+
+# Initialize audio recorder
+audio_recorder = AudioRecorder()
 
 # Document fingerprinting system
 document_fingerprints = {}  # Store document hashes
@@ -55,18 +129,6 @@ similarity_threshold = 0.95  # Very strict similarity threshold (0-1)
 max_fingerprints = 50  # Maximum fingerprints to store
 restriction_violations = 0  # Track restriction violations
 max_restriction_violations = 5  # Max violations before system lockout
-
-# Audio settings
-audio_quality_levels = {
-    'standby': {'sample_rate': 16000, 'chunk_size': 512},
-    'active': {'sample_rate': 44100, 'chunk_size': 1024},
-    'high': {'sample_rate': 48000, 'chunk_size': 2048}
-}
-current_quality = 'active'
-
-# Audio processor
-audio = pyaudio.PyAudio()
-audio_stream = None
 
 # OCR processor
 try:
@@ -128,9 +190,6 @@ except Exception as e:
     print(f"⚠️ Database initialization failed: {e}")
     db_conn = None
     db_cursor = None
-audio_recording = False
-audio_data = []
-
 # Camera processor
 camera = None
 camera_recording = False
@@ -406,10 +465,6 @@ async def get_main_page():
                             <div class="status-indicator active" id="standby-status"></div>
                         </div>
                         <div class="status-item">
-                            <span>🎤 Voice Detection</span>
-                            <div class="status-indicator" id="voice-status"></div>
-                        </div>
-                        <div class="status-item">
                             <span>📄 Document Detection</span>
                             <div class="status-indicator" id="document-status"></div>
                         </div>
@@ -419,8 +474,8 @@ async def get_main_page():
                         </div>
                     </div>
                     <div style="margin-top: 15px;">
-                        <span>🔊 Audio Quality: </span>
-                        <span class="quality-indicator quality-active" id="audio-quality">🎤 Active</span>
+                        <span>📸 Camera Status: </span>
+                        <span class="quality-indicator quality-active" id="camera-quality">📹 Active</span>
                     </div>
                     <div class="model-status">
                         ✅ Advanced OpenCV Document Detection Active
@@ -436,14 +491,29 @@ async def get_main_page():
                     </div>
                 </div>
                 
-                <!-- Audio Level -->
+                <!-- Audio Recording Status -->
                 <div class="card">
-                    <h3>🔊 Audio Level</h3>
-                    <div class="progress-bar">
-                        <div class="progress-fill" id="audio-level"></div>
-                    </div>
-                    <div style="text-align: center; margin-top: 10px;">
-                        <span id="audio-level-text">Audio Level: 0%</span>
+                    <h3>🎤 Audio Recording</h3>
+                    <div style="text-align: center;">
+                        <div id="audio-indicator" style="margin-bottom: 15px; padding: 15px; border-radius: 8px; background: rgba(0, 255, 0, 0.3);">
+                            <div style="font-size: 1.2rem; margin-bottom: 10px;">
+                                🔴 <span id="audio-status">Recording</span>
+                            </div>
+                            <div style="font-size: 1rem;">
+                                Duration: <span id="audio-duration">00:00</span>
+                            </div>
+                            <div style="font-size: 0.9rem; margin-top: 5px; opacity: 0.8;">
+                                <span id="audio-info">Continuous 16-bit recording</span>
+                            </div>
+                        </div>
+                        <div style="margin-top: 10px;">
+                            <button class="btn" id="stop-recording" style="background: linear-gradient(45deg, #f44336, #d32f2f);">
+                                ⏹️ Stop Recording
+                            </button>
+                            <button class="btn" id="start-recording" style="background: linear-gradient(45deg, #4CAF50, #45a049);">
+                                ▶️ Start Recording
+                            </button>
+                        </div>
                     </div>
                 </div>
                 
@@ -515,6 +585,57 @@ async def get_main_page():
             let isStandbyMode = false;
             let autoCaptureEnabled = true;
             let captureCount = 0;
+            let audioStartTime = null;
+            let audioInterval = null;
+            
+            // Update audio recording status display
+            function updateAudioStatus(isRecording, duration = 0, info = '') {
+                const audioIndicator = document.getElementById('audio-indicator');
+                const audioStatus = document.getElementById('audio-status');
+                const audioDuration = document.getElementById('audio-duration');
+                const audioInfo = document.getElementById('audio-info');
+                const startBtn = document.getElementById('start-recording');
+                const stopBtn = document.getElementById('stop-recording');
+                
+                if (isRecording) {
+                    audioIndicator.style.display = 'block';
+                    audioIndicator.style.background = 'rgba(0, 255, 0, 0.3)';
+                    audioStatus.textContent = 'Recording';
+                    audioInfo.textContent = info || 'Continuous 16-bit recording';
+                    startBtn.style.display = 'none';
+                    stopBtn.style.display = 'inline-block';
+                    
+                    // Start duration timer
+                    if (!audioStartTime) {
+                        audioStartTime = Date.now();
+                        audioInterval = setInterval(updateAudioDuration, 1000);
+                    }
+                } else {
+                    audioIndicator.style.display = 'none';
+                    audioStatus.textContent = 'Not Recording';
+                    audioInfo.textContent = 'Audio recording stopped';
+                    startBtn.style.display = 'inline-block';
+                    stopBtn.style.display = 'none';
+                    
+                    // Stop duration timer
+                    if (audioInterval) {
+                        clearInterval(audioInterval);
+                        audioInterval = null;
+                        audioStartTime = null;
+                    }
+                }
+            }
+            
+            // Update audio recording duration
+            function updateAudioDuration() {
+                if (audioStartTime) {
+                    const elapsed = Math.floor((Date.now() - audioStartTime) / 1000);
+                    const minutes = Math.floor(elapsed / 60);
+                    const seconds = elapsed % 60;
+                    const durationText = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                    document.getElementById('audio-duration').textContent = durationText;
+                }
+            }
             
             // Initialize WebSocket
             function initWebSocket() {
@@ -523,9 +644,12 @@ async def get_main_page():
                 ws.onopen = function() {
                     addLog('Connected to Smart Glasses system', 'success');
                     addLog('🚀 All systems starting automatically', 'success');
-                    addLog('🎤 Voice detection enabled', 'info');
+                    addLog('🎤 Audio recording enabled', 'info');
                     addLog('📄 Advanced document detection enabled', 'info');
                     addLog('📸 Auto capture enabled', 'info');
+                    
+                    // Start audio recording status display
+                    updateAudioStatus(true);
                 };
                 
                 ws.onmessage = function(event) {
@@ -545,17 +669,14 @@ async def get_main_page():
                     case 'status_update':
                         updateStatus(data.status);
                         break;
-                    case 'audio_level':
-                        updateAudioLevel(data.level);
-                        break;
                     case 'camera_frame':
                         updateCameraFeed(data.frame);
                         break;
                     case 'log_message':
                         addLog(data.message, data.level || 'info');
                         break;
-                    case 'voice_detected':
-                        handleVoiceDetection(data.detected);
+                    case 'audio_status':
+                        updateAudioStatus(data.recording, data.duration, data.info);
                         break;
                     case 'document_detected':
                         handleDocumentDetection(data.detected, data.confidence);
@@ -588,31 +709,17 @@ async def get_main_page():
             function updateStatus(status) {
                 document.getElementById('standby-status').className = 
                     'status-indicator' + (status.standby ? ' standby' : ' active');
-                document.getElementById('voice-status').className = 
-                    'status-indicator' + (status.voice ? ' active' : '');
                 document.getElementById('document-status').className = 
                     'status-indicator' + (status.document ? ' active' : '');
                 document.getElementById('auto-capture-status').className = 
                     'status-indicator' + (status.auto_capture ? ' active' : '');
                 
-                // Update audio quality
-                const qualityElement = document.getElementById('audio-quality');
-                if (status.quality === 'standby') {
-                    qualityElement.textContent = '😴 Standby';
-                    qualityElement.className = 'quality-indicator quality-standby';
-                } else if (status.quality === 'active') {
-                    qualityElement.textContent = '🎤 Active';
+                // Update camera quality
+                const qualityElement = document.getElementById('camera-quality');
+                if (qualityElement) {
+                    qualityElement.textContent = '📹 Active';
                     qualityElement.className = 'quality-indicator quality-active';
-                } else if (status.quality === 'high') {
-                    qualityElement.textContent = '🔊 High';
-                    qualityElement.className = 'quality-indicator quality-high';
                 }
-            }
-            
-            // Update audio level
-            function updateAudioLevel(level) {
-                document.getElementById('audio-level').style.width = level + '%';
-                document.getElementById('audio-level-text').textContent = 'Audio Level: ' + level + '%';
             }
             
             // Update camera feed
@@ -620,15 +727,6 @@ async def get_main_page():
                 const img = document.getElementById('camera-feed');
                 img.src = 'data:image/jpeg;base64,' + frameData;
                 img.style.display = 'block';
-            }
-            
-            // Handle voice detection
-            function handleVoiceDetection(detected) {
-                if (detected) {
-                    addLog('🎤 Voice detected - Increasing audio quality', 'success');
-                } else {
-                    addLog('😴 Voice lost - Returning to standby', 'info');
-                }
             }
             
             // Handle document detection
@@ -695,6 +793,14 @@ async def get_main_page():
                 sendCommand('open_folder', {folder: 'documents'});
             };
             
+            document.getElementById('start-recording').onclick = function() {
+                sendCommand('start_audio_recording');
+            };
+            
+            document.getElementById('stop-recording').onclick = function() {
+                sendCommand('stop_audio_recording');
+            };
+            
             document.getElementById('clear-files').onclick = function() {
                 sendCommand('clear_files');
             };
@@ -731,22 +837,13 @@ async def websocket_endpoint(websocket: WebSocket):
             # Send status update
             status = {
                 'standby': standby_mode,
-                'voice': voice_detected,
                 'document': document_detected,
-                'auto_capture': auto_capture_enabled,
-                'quality': get_audio_quality()
+                'auto_capture': auto_capture_enabled
             }
             
             await websocket.send_json({
                 'type': 'status_update',
                 'status': status
-            })
-            
-            # Send audio level
-            audio_level = get_audio_level()
-            await websocket.send_json({
-                'type': 'audio_level',
-                'level': audio_level
             })
             
             # Send camera frame
@@ -769,40 +866,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 
     except WebSocketDisconnect:
         connections.remove(websocket)
-
-def get_audio_level():
-    """Get current audio level with improved detection"""
-    if audio_stream and audio_recording:
-        try:
-            data = audio_stream.read(1024, exception_on_overflow=False)
-            audio_array = np.frombuffer(data, dtype=np.int16)
-            
-            # Improved voice detection with multiple metrics
-            rms = np.sqrt(np.mean(audio_array**2))
-            peak = np.max(np.abs(audio_array))
-            zero_crossings = np.sum(np.diff(np.sign(audio_array)) != 0)
-            
-            # Combine metrics for better detection
-            level = min(100, (rms / 32767) * 100)
-            
-            # Add zero-crossing rate for voice detection
-            zcr = zero_crossings / len(audio_array)
-            if zcr > 0.1:  # High zero-crossing rate indicates speech
-                level *= 1.5  # Boost level for speech-like signals
-                
-            return int(min(100, level))
-        except:
-            return 0
-    return 0
-
-def get_audio_quality():
-    """Get current audio quality level"""
-    if voice_detected:
-        return 'active'
-    elif standby_mode:
-        return 'standby'
-    else:
-        return 'high'
 
 def get_camera_frame():
     """Get current camera frame"""
@@ -2707,10 +2770,6 @@ async def handle_command(websocket: WebSocket, message: dict):
         auto_capture_enabled = not auto_capture_enabled
         await send_log(f'Auto capture {"enabled" if auto_capture_enabled else "disabled"}', 'info')
     
-    elif command == 'force_audio':
-        start_audio_recording()
-        await send_log('Manual audio recording started', 'success')
-    
     elif command == 'force_video':
         start_video_recording()
         await send_log('Manual video recording started', 'success')
@@ -2723,11 +2782,31 @@ async def handle_command(websocket: WebSocket, message: dict):
         await send_log(f'Sensitivity set to {int(message.get("sensitivity", 0.7) * 100)}%', 'info')
     
     elif command == 'open_folder':
-        folder = message.get('folder', 'audio')
+        folder = message.get('folder', 'video')
         await send_log(f'Opening {folder} folder', 'info')
     
     elif command == 'clear_files':
         await send_log('Clearing old files', 'info')
+    
+    elif command == 'start_audio_recording':
+        audio_recorder.start_recording()
+        await send_log('🎤 Audio recording started', 'success')
+        await websocket_broadcast({
+            'type': 'audio_status',
+            'recording': True,
+            'duration': 0,
+            'info': 'Continuous 16-bit recording'
+        })
+    
+    elif command == 'stop_audio_recording':
+        filename, duration = audio_recorder.stop_recording()
+        await send_log(f'🛑 Audio recording stopped. Duration: {duration:.1f}s', 'info')
+        await websocket_broadcast({
+            'type': 'audio_status',
+            'recording': False,
+            'duration': duration,
+            'info': f'Recording saved: {filename}'
+        })
     
     elif command == 'save_log':
         await send_log('Log saved', 'success')
@@ -2743,24 +2822,6 @@ async def send_log(message: str, level: str = 'info'):
             })
         except:
             pass
-
-def start_audio_recording():
-    """Start audio recording"""
-    global audio_stream, audio_recording, audio_data
-    
-    if not audio_recording:
-        try:
-            audio_stream = audio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=audio_quality_levels[current_quality]['sample_rate'],
-                input=True,
-                frames_per_buffer=audio_quality_levels[current_quality]['chunk_size']
-            )
-            audio_recording = True
-            audio_data = []
-        except Exception as e:
-            print(f"Audio recording error: {e}")
 
 def start_video_recording():
     """Start video recording"""
@@ -2782,51 +2843,25 @@ def init_camera():
     except Exception as e:
         print(f"Camera initialization error: {e}")
 
-# Background tasks
-async def voice_detection():
-    """Voice activity detection"""
-    global voice_detected, current_quality
-    
-    while True:
+async def websocket_broadcast(message):
+    """Broadcast message to all WebSocket connections"""
+    for connection in connections:
         try:
-            if standby_mode:
-                audio_level = get_audio_level()
-                
-                if audio_level > 8:  # Lower threshold for better voice detection
-                    if not voice_detected:
-                        voice_detected = True
-                        current_quality = 'active'
-                        await send_log('🎤 Voice detected - Increasing audio quality', 'success')
-                        
-                        # Notify all connections
-                        for connection in connections:
-                            try:
-                                await connection.send_json({
-                                    'type': 'voice_detected',
-                                    'detected': True
-                                })
-                            except:
-                                pass
-                else:
-                    if voice_detected:
-                        voice_detected = False
-                        current_quality = 'standby'
-                        await send_log('😴 Voice lost - Returning to standby', 'info')
-                        
-                        # Notify all connections
-                        for connection in connections:
-                            try:
-                                await connection.send_json({
-                                    'type': 'voice_detected',
-                                    'detected': False
-                                })
-                            except:
-                                pass
-            
-            await asyncio.sleep(0.2)
-        except Exception as e:
-            print(f"Voice detection error: {e}")
-            await asyncio.sleep(1)
+            await connection.send_json(message)
+        except:
+            pass
+
+async def send_log(message: str, level: str = 'info'):
+    """Send log message to all connections"""
+    for connection in connections:
+        try:
+            await connection.send_json({
+                'type': 'log_message',
+                'message': message,
+                'level': level
+            })
+        except:
+            pass
 
 async def document_detection():
     """Advanced document detection and auto capture"""
@@ -2886,16 +2921,32 @@ async def document_detection():
             print(f"Document detection error: {e}")
             await asyncio.sleep(1)
 
-# Start background tasks
+# Signal handler for graceful shutdown
+def signal_handler(signum, frame):
+    """Handle shutdown signals"""
+    print(f"\n🛑 Received signal {signum}, saving audio recording...")
+    if audio_recorder.is_recording():
+        filename, duration = audio_recorder.stop_recording()
+        if filename:
+            print(f"💾 Final audio recording saved: {filename} ({duration:.1f}s)")
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks"""
-    asyncio.create_task(voice_detection())
+    # Start audio recording automatically
+    print("🎤 Starting audio recording...")
+    audio_recorder.start_recording()
+    
+    # Start background tasks
     asyncio.create_task(document_detection())
     
     # Initialize and start all systems automatically
     init_camera()
-    start_audio_recording()
     start_video_recording()
     
     print("🚀 All systems started automatically!")
@@ -2904,10 +2955,11 @@ async def startup_event():
     print("🎯 95%+ similarity + 12 restrictive checks + quality scoring")
     print("🔍 Pre-filtering + Multi-modal analysis + System lockout")
     print("⚡ Sophisticated fingerprint storage with intelligent eviction")
+    print("🎤 Continuous 16-bit audio recording started")
 
 if __name__ == "__main__":
     print("🔬 Starting Smart Glasses - Best Document Detection...")
     print("📱 Open: http://localhost:8006")
-    print("🚀 Auto-start • 🎤 Voice detection • 📄 Smart Document detection • 🔒 Ultra-Restrictive Duplicate prevention")
+    print("🚀 Auto-start • 🎤 Audio recording • 📄 Smart Document detection • 🔒 Ultra-Restrictive Duplicate prevention")
     
     uvicorn.run(app, host="127.0.0.1", port=8006)
