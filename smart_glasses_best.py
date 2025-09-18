@@ -8,6 +8,7 @@ import asyncio
 import json
 import base64
 import time
+import os
 import cv2
 import numpy as np
 from datetime import datetime
@@ -48,6 +49,69 @@ standby_mode = False
 document_detected = False
 auto_capture_enabled = True
 capture_count = 0
+file_counter = 1  # Global counter for file numbering
+
+def get_filename_with_counter(file_type="document"):
+    """Generate filename with counter and date format: {number}_DD_MM_YYYY"""
+    global file_counter
+    now = datetime.now()
+    date_str = now.strftime("%d_%m_%Y")
+    
+    # Check existing files to determine the next counter
+    if file_type == "audio":
+        audio_dir = Path("data/audio")
+        if audio_dir.exists():
+            existing_files = [f for f in audio_dir.glob(f"*_{date_str}.wav") if f.is_file()]
+            if existing_files:
+                # Extract numbers from existing files and find the highest
+                numbers = []
+                for file in existing_files:
+                    try:
+                        # Extract number from filename like "001_19_09_2025.wav"
+                        number_str = file.stem.split('_')[0]
+                        numbers.append(int(number_str))
+                    except (ValueError, IndexError):
+                        continue
+                
+                if numbers:
+                    file_counter = max(numbers) + 1
+                else:
+                    file_counter = 1
+            else:
+                file_counter = 1
+        else:
+            file_counter = 1
+    elif file_type == "document":
+        docs_dir = Path("data/documents")
+        if docs_dir.exists():
+            existing_files = [f for f in docs_dir.glob(f"*_{date_str}.jpg") if f.is_file()]
+            if existing_files:
+                numbers = []
+                for file in existing_files:
+                    try:
+                        number_str = file.stem.split('_')[0]
+                        numbers.append(int(number_str))
+                    except (ValueError, IndexError):
+                        continue
+                
+                if numbers:
+                    file_counter = max(numbers) + 1
+                else:
+                    file_counter = 1
+            else:
+                file_counter = 1
+        else:
+            file_counter = 1
+    
+    filename = f"{file_counter:03d}_{date_str}"
+    
+    if file_type == "document":
+        filename += ".jpg"
+    elif file_type == "audio":
+        filename += ".wav"  # Will be converted to MP3 automatically
+    
+    file_counter += 1
+    return filename
 last_capture_time = 0
 
 # Audio recording settings
@@ -62,22 +126,22 @@ class AudioRecorder:
         self.current_file = None
         self.file_index = 1
         self.recording_start_time = None
-        print("✅ Audio recorder initialized")
+        print("[OK] Audio recorder initialized")
     
     def start_recording(self):
         """Start continuous audio recording"""
         if not self.recording:
             self.recording = True
             self.recording_start_time = time.time()
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.current_file = str(AUDIO_DIR / f"recording_{timestamp}.wav")
+            filename = get_filename_with_counter("audio")
+            self.current_file = str(AUDIO_DIR / filename)
             
             # Start recording in a separate thread
             self.recording_thread = threading.Thread(target=self._record_chunk)
             self.recording_thread.daemon = True
             self.recording_thread.start()
             
-            print(f"🎤 Audio recording started: {self.current_file}")
+            print(f"[MIC] Audio recording started: {self.current_file}")
     
     def stop_recording(self):
         """Stop audio recording"""
@@ -87,7 +151,9 @@ class AudioRecorder:
                 self.recording_thread.join(timeout=2)
             
             duration = time.time() - self.recording_start_time if self.recording_start_time else 0
-            print(f"🛑 Audio recording stopped. Duration: {duration:.1f}s")
+            print(f"[STOP] Audio recording stopped. Duration: {duration:.1f}s")
+            print(f"[INFO] WAV file saved - Dock will convert to MP3 automatically")
+            
             return self.current_file, duration
     
     def _record_chunk(self):
@@ -106,15 +172,15 @@ class AudioRecorder:
                     wf.writeframes(data)
 
             with sd.InputStream(samplerate=AUDIO_RATE, channels=AUDIO_CHANNELS, callback=callback):
-                print(f"🎤 Recording {self.current_file}...")
+                print(f"[RECORD] Recording {self.current_file}...")
                 while self.recording:
                     time.sleep(0.1)
 
             wf.close()
-            print(f"💾 Saved {self.current_file}")
+            print(f"[SAVED] Saved {self.current_file}")
             
         except Exception as e:
-            print(f"❌ Audio recording error: {e}")
+            print(f"[ERROR] Audio recording error: {e}")
     
     def is_recording(self):
         """Check if currently recording"""
@@ -2660,8 +2726,7 @@ def is_duplicate_document(image):
             return True, f"Similar to {best_match['filename']} ({match_type}: {similarity:.3f})"
         
         # === PHASE 4: STORE WITH SOPHISTICATED INDEXING ===
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"document_{timestamp}.jpg"
+        filename = get_filename_with_counter("document")
         
         # Store with sophisticated indexing
         store_sophisticated_fingerprint(filename, document_signature)
@@ -2897,8 +2962,8 @@ async def document_detection():
                             await send_log(f'🚫 Duplicate document skipped: {duplicate_reason}', 'info')
                             last_capture_time = time.time()  # Reset timer to prevent spam
                         else:
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            doc_file = DOCS_DIR / f"document_{timestamp}.jpg"
+                            filename = get_filename_with_counter("document")
+                            doc_file = DOCS_DIR / filename
                             
                             cv2.imwrite(str(doc_file), frame)
                             last_capture_time = time.time()
