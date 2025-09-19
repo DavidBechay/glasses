@@ -74,73 +74,28 @@ class Config:
 
 config = Config()
 
-# Audio Converter
+# Audio Converter - DISABLED (keeping WAV files only)
 class AudioConverter:
     def __init__(self):
-        self.available = AUDIO_PROCESSING_AVAILABLE
+        self.available = False  # MP3 conversion disabled
         
     def convert_wav_to_mp3(self, input_path: Path, output_path: Path = None) -> Path:
-        """Convert WAV file to MP3 format"""
-        if not self.available:
-            raise RuntimeError("Audio processing not available - pydub not installed")
-        
-        if not input_path.exists():
-            raise FileNotFoundError(f"Input file not found: {input_path}")
-        
-        # Generate output path if not provided
-        if output_path is None:
-            output_path = input_path.with_suffix('.mp3')
-        
-        try:
-            logger.info(f"Converting {input_path} to MP3...")
-            
-            # Load WAV file
-            audio = AudioSegment.from_wav(str(input_path))
-            
-            # Try to export as MP3, fallback to WAV if FFmpeg not available
-            try:
-                audio.export(
-                    str(output_path),
-                    format="mp3",
-                    bitrate="192k",  # Good quality, reasonable file size
-                    parameters=["-q:a", "2"]  # High quality encoding
-                )
-                logger.info(f"Successfully converted to MP3: {output_path}")
-            except Exception as ffmpeg_error:
-                logger.warning(f"FFmpeg not available for MP3 conversion: {ffmpeg_error}")
-                logger.info("Creating compressed WAV instead...")
-                
-                # Fallback: Create a compressed WAV file
-                compressed_path = input_path.with_suffix('.compressed.wav')
-                audio.export(
-                    str(compressed_path),
-                    format="wav",
-                    parameters=["-acodec", "pcm_s16le", "-ar", "22050"]  # Lower quality WAV
-                )
-                
-                # Rename to MP3 extension for consistency
-                compressed_path.rename(output_path)
-                logger.info(f"Created compressed audio file: {output_path}")
-            
-            return output_path
-            
-        except Exception as e:
-            logger.error(f"Error converting audio: {e}")
-            raise
+        """MP3 conversion disabled - keeping WAV files only"""
+        logger.info(f"MP3 conversion disabled - keeping WAV file: {input_path}")
+        return input_path  # Return original WAV file
     
     def get_audio_info(self, file_path: Path) -> Dict[str, Any]:
         """Get audio file information"""
-        if not self.available:
-            return {}
-        
         try:
-            audio = AudioSegment.from_file(str(file_path))
-            return {
-                "duration": len(audio) / 1000.0,  # Duration in seconds
-                "channels": audio.channels,
-                "sample_rate": audio.frame_rate,
-                "bitrate": audio.frame_rate * audio.channels * audio.sample_width * 8
-            }
+            # Try to get basic file info without pydub
+            import wave
+            with wave.open(str(file_path), 'rb') as wav_file:
+                return {
+                    "duration": wav_file.getnframes() / wav_file.getframerate(),
+                    "channels": wav_file.getnchannels(),
+                    "sample_rate": wav_file.getframerate(),
+                    "bitrate": wav_file.getframerate() * wav_file.getnchannels() * 16
+                }
         except Exception as e:
             logger.error(f"Error getting audio info: {e}")
             return {}
@@ -480,6 +435,251 @@ class DocumentProcessor:
         
         return enhanced
 
+# Appointment Extractor
+class AppointmentExtractor:
+    def __init__(self):
+        self.appointment_keywords = [
+            'appointment', 'meeting', 'schedule', 'book', 'reserve', 'plan',
+            'call', 'visit', 'interview', 'consultation', 'checkup', 'exam',
+            'quiz', 'test', 'lecture', 'class', 'session', 'workshop',
+            'lunch', 'dinner', 'coffee', 'drinks', 'date', 'event'
+        ]
+        
+        self.time_patterns = [
+            r'\b(\d{1,2}):(\d{2})\s*(am|pm|AM|PM)\b',
+            r'\b(\d{1,2})\s*(am|pm|AM|PM)\b',
+            r'\b(morning|afternoon|evening|night)\b',
+            r'\b(tomorrow|today|yesterday)\b',
+            r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b',
+            r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\b',
+            r'\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b',
+            r'\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b'
+        ]
+        
+        self.date_patterns = [
+            r'\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b',
+            r'\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b',
+            r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})\b',
+            r'\b(tomorrow|today|yesterday)\b',
+            r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b'
+        ]
+    
+    def extract_appointments(self, transcript: str, audio_file_id: int) -> List[Dict[str, Any]]:
+        """Extract appointment information from transcript"""
+        import re
+        from datetime import datetime, timedelta
+        
+        appointments = []
+        
+        if not transcript or len(transcript.strip()) < 10:
+            return appointments
+        
+        # Split transcript into sentences
+        sentences = re.split(r'[.!?]+', transcript)
+        
+        # Track processed appointments to avoid duplicates
+        processed_appointments = set()
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) < 10:
+                continue
+            
+            # Check if sentence contains appointment keywords
+            keyword_match = any(keyword in sentence.lower() for keyword in self.appointment_keywords)
+            if not keyword_match:
+                continue
+            
+            # Extract time information
+            time_info = self._extract_time(sentence)
+            date_info = self._extract_date(sentence)
+            
+            if time_info or date_info:
+                # Create a unique key for this appointment to avoid duplicates
+                appointment_key = self._create_appointment_key(sentence, time_info, date_info)
+                
+                if appointment_key not in processed_appointments:
+                    appointment = {
+                        'title': self._extract_title(sentence),
+                        'description': sentence,
+                        'time': time_info,
+                        'date': date_info,
+                        'audio_file_id': audio_file_id,
+                        'created_at': datetime.now(),
+                        'status': 'pending'
+                    }
+                    appointments.append(appointment)
+                    processed_appointments.add(appointment_key)
+        
+        # Post-process to merge similar appointments
+        appointments = self._merge_similar_appointments(appointments)
+        
+        return appointments
+    
+    def _create_appointment_key(self, sentence: str, time_info: str, date_info: str) -> str:
+        """Create a unique key for an appointment to avoid duplicates"""
+        # Extract the main keywords and date/time info
+        keywords_found = [kw for kw in self.appointment_keywords if kw in sentence.lower()]
+        main_keyword = keywords_found[0] if keywords_found else "appointment"
+        
+        # Create key based on main keyword and date/time
+        key_parts = [main_keyword]
+        if date_info:
+            key_parts.append(date_info.lower())
+        if time_info:
+            key_parts.append(time_info.lower())
+        
+        return "|".join(key_parts)
+    
+    def _merge_similar_appointments(self, appointments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge similar appointments to avoid repetition"""
+        if len(appointments) <= 1:
+            return appointments
+        
+        merged = []
+        used_indices = set()
+        
+        for i, appointment in enumerate(appointments):
+            if i in used_indices:
+                continue
+            
+            # Find similar appointments to merge
+            similar_appointments = [appointment]
+            used_indices.add(i)
+            
+            for j, other_appointment in enumerate(appointments[i+1:], i+1):
+                if j in used_indices:
+                    continue
+                
+                if self._are_similar_appointments(appointment, other_appointment):
+                    similar_appointments.append(other_appointment)
+                    used_indices.add(j)
+            
+            # Merge similar appointments
+            if len(similar_appointments) > 1:
+                merged_appointment = self._merge_appointment_group(similar_appointments)
+                merged.append(merged_appointment)
+            else:
+                merged.append(appointment)
+        
+        return merged
+    
+    def _are_similar_appointments(self, appt1: Dict[str, Any], appt2: Dict[str, Any]) -> bool:
+        """Check if two appointments are similar enough to merge"""
+        # Check if they have the same date/time
+        if appt1.get('date') == appt2.get('date') and appt1.get('time') == appt2.get('time'):
+            return True
+        
+        # Check if they have similar keywords
+        keywords1 = [kw for kw in self.appointment_keywords if kw in appt1['description'].lower()]
+        keywords2 = [kw for kw in self.appointment_keywords if kw in appt2['description'].lower()]
+        
+        if keywords1 and keywords2 and any(kw in keywords2 for kw in keywords1):
+            # Check if they have overlapping date/time info
+            if (appt1.get('date') and appt2.get('date') and 
+                appt1['date'].lower() in appt2['date'].lower() or 
+                appt2['date'].lower() in appt1['date'].lower()):
+                return True
+        
+        return False
+    
+    def _merge_appointment_group(self, appointments: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Merge a group of similar appointments into one"""
+        # Use the most complete description
+        best_description = max(appointments, key=lambda x: len(x['description']))['description']
+        
+        # Use the most specific title
+        best_title = max(appointments, key=lambda x: len(x['title']))['title']
+        
+        # Use the most specific date/time
+        best_date = None
+        best_time = None
+        
+        for appt in appointments:
+            if appt.get('date') and (not best_date or len(appt['date']) > len(best_date)):
+                best_date = appt['date']
+            if appt.get('time') and (not best_time or len(appt['time']) > len(best_time)):
+                best_time = appt['time']
+        
+        return {
+            'title': best_title,
+            'description': best_description,
+            'time': best_time,
+            'date': best_date,
+            'audio_file_id': appointments[0]['audio_file_id'],
+            'created_at': appointments[0]['created_at'],
+            'status': appointments[0]['status']
+        }
+    
+    def _extract_time(self, text: str) -> str:
+        """Extract time information from text"""
+        import re
+        
+        # Look for time patterns
+        for pattern in self.time_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                return matches[0] if isinstance(matches[0], str) else ' '.join(matches[0])
+        
+        return None
+    
+    def _extract_date(self, text: str) -> str:
+        """Extract date information from text"""
+        import re
+        
+        # Look for date patterns
+        for pattern in self.date_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                return matches[0] if isinstance(matches[0], str) else ' '.join(matches[0])
+        
+        return None
+    
+    def _extract_title(self, text: str) -> str:
+        """Extract a title for the appointment"""
+        # Find the main keyword
+        keywords_found = [kw for kw in self.appointment_keywords if kw in text.lower()]
+        main_keyword = keywords_found[0] if keywords_found else "appointment"
+        
+        # Extract date/time info for the title
+        date_info = self._extract_date(text)
+        time_info = self._extract_time(text)
+        
+        # Create a more descriptive title
+        title_parts = []
+        
+        # Add the main keyword (capitalized)
+        title_parts.append(main_keyword.capitalize())
+        
+        # Add date if available
+        if date_info:
+            title_parts.append(date_info)
+        
+        # Add time if available and different from date
+        if time_info and time_info != date_info:
+            title_parts.append(time_info)
+        
+        # If we have a good title, use it
+        if len(title_parts) > 1:
+            title = " ".join(title_parts)
+        else:
+            # Fallback to first few words
+            words = text.split()[:5]
+            title = ' '.join(words)
+            
+            # Clean up the title
+            title = title.replace('appointment', '').replace('meeting', '').replace('schedule', '')
+            title = title.strip()
+        
+        # Limit length
+        if len(title) > 50:
+            title = title[:47] + '...'
+        
+        return title or 'Appointment'
+
+# Initialize appointment extractor
+appointment_extractor = AppointmentExtractor()
+
 # Initialize document processor
 document_processor = DocumentProcessor()
 
@@ -542,6 +742,21 @@ class DatabaseManager:
                 )
             ''')
             
+            # Appointments table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS appointments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    appointment_date DATE,
+                    appointment_time TIME,
+                    audio_file_id INTEGER,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (audio_file_id) REFERENCES audio_files (id)
+                )
+            ''')
+            
             conn.commit()
     
     @contextmanager
@@ -568,6 +783,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Startup event to start automatic scanning
+@app.on_event("startup")
+async def startup_event():
+    """Start automatic directory scanning on app startup"""
+    async def auto_scan_loop():
+        """Background task to automatically scan directories every 5 seconds"""
+        while True:
+            try:
+                await scan_directories()
+                await asyncio.sleep(5)  # Scan every 5 seconds
+            except Exception as e:
+                logger.error(f"Error in auto-scan: {e}")
+                await asyncio.sleep(10)  # Wait longer on error
+    
+    # Start the background task
+    asyncio.create_task(auto_scan_loop())
+    logger.info("🔄 Automatic directory scanning started (every 5 seconds)")
 
 # WebSocket connections
 connections: List[WebSocket] = []
@@ -924,6 +1157,121 @@ async def root():
                 font-size: 11px;
                 margin-bottom: 6px;
                 font-style: italic;
+            }
+            
+            /* Appointments Styles */
+            .appointments-list {
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+                padding: 20px;
+            }
+            
+            .appointment-item {
+                background: white;
+                border: 1px solid #dadce0;
+                border-radius: 8px;
+                padding: 16px;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                transition: all 0.2s ease;
+            }
+            
+            .appointment-item:hover {
+                box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+                transform: translateY(-1px);
+            }
+            
+            .appointment-item.completed {
+                opacity: 0.6;
+                background: #f8f9fa;
+            }
+            
+            .appointment-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-start;
+                margin-bottom: 8px;
+            }
+            
+            .appointment-title {
+                font-size: 16px;
+                font-weight: 500;
+                color: #202124;
+                margin: 0;
+            }
+            
+            .appointment-status {
+                padding: 4px 8px;
+                border-radius: 12px;
+                font-size: 12px;
+                font-weight: 500;
+                text-transform: uppercase;
+            }
+            
+            .appointment-status.pending {
+                background: #fff3cd;
+                color: #856404;
+            }
+            
+            .appointment-status.completed {
+                background: #d4edda;
+                color: #155724;
+            }
+            
+            .appointment-time {
+                color: #5f6368;
+                font-size: 14px;
+                margin-bottom: 8px;
+            }
+            
+            .appointment-description {
+                color: #5f6368;
+                font-size: 14px;
+                line-height: 1.4;
+                margin-bottom: 12px;
+            }
+            
+            .appointment-actions {
+                display: flex;
+                gap: 8px;
+            }
+            
+            .appointment-btn {
+                background: #4285f4;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 4px;
+                font-size: 12px;
+                cursor: pointer;
+                transition: background 0.2s ease;
+            }
+            
+            .appointment-btn:hover {
+                background: #3367d6;
+            }
+            
+            .appointment-btn.complete {
+                background: #34a853;
+            }
+            
+            .appointment-btn.complete:hover {
+                background: #2d8f47;
+            }
+            
+            .appointment-btn.delete {
+                background: #ea4335;
+            }
+            
+            .appointment-btn.delete:hover {
+                background: #d33b2c;
+            }
+            
+            .no-appointments {
+                text-align: center;
+                color: #5f6368;
+                font-style: italic;
+                padding: 40px 20px;
             }
             
             .search-result-preview {
@@ -1302,9 +1650,6 @@ async def root():
                 <input type="text" class="search-box" placeholder="Search files..." id="searchInput">
             </div>
             <div class="header-right">
-                <button class="btn" onclick="scanDirectories()">
-                    <span>📁</span> Scan Directories
-                </button>
                 <button class="btn btn-secondary" onclick="loadFiles()">
                     <span>🔄</span> Refresh
                 </button>
@@ -1394,6 +1739,22 @@ async def root():
                     </div>
                 </div>
             </div>
+            
+            <!-- Appointments Section -->
+            <div class="files-section">
+                <div class="files-header">
+                    <div class="files-title">📅 Extracted Appointments</div>
+                    <button class="btn btn-secondary" onclick="loadAppointments()">
+                        <span>🔄</span> Refresh
+                    </button>
+                </div>
+                <div id="appointments-list" class="appointments-list">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <div>Loading appointments...</div>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <script>
@@ -1424,13 +1785,18 @@ async def root():
             
             async function loadFiles() {
                 try {
+                    console.log('Loading files...');
                     // Load regular files
                     const response = await fetch('/api/files');
+                    console.log('Files response:', response.status);
                     const data = await response.json();
+                    console.log('Files data:', data);
                     
                     // Load scanned documents
                     const scannedResponse = await fetch('/api/scanned-documents');
+                    console.log('Scanned response:', scannedResponse.status);
                     const scannedData = await scannedResponse.json();
+                    console.log('Scanned data:', scannedData);
                     
                     // Combine files and scanned documents
                     const allFiles = [...data.files];
@@ -1449,12 +1815,13 @@ async def root():
                         });
                     });
                     
+                    console.log('All files:', allFiles);
                     displayFiles(allFiles);
                 } catch (error) {
                     console.error('Error loading files:', error);
-                    document.getElementById('audio-files-grid').innerHTML = '<p>Error loading files</p>';
-                    document.getElementById('pictures-files-grid').innerHTML = '<p>Error loading files</p>';
-                    document.getElementById('scanned-files-grid').innerHTML = '<p>Error loading files</p>';
+                    document.getElementById('audio-files-grid').innerHTML = '<p>Error loading files: ' + error.message + '</p>';
+                    document.getElementById('pictures-files-grid').innerHTML = '<p>Error loading files: ' + error.message + '</p>';
+                    document.getElementById('scanned-files-grid').innerHTML = '<p>Error loading files: ' + error.message + '</p>';
                 }
             }
             
@@ -1587,6 +1954,96 @@ async def root():
                     }
                 } catch (error) {
                     alert(`Error opening audio: ${error.message}`);
+                }
+            }
+            
+            // Appointments Functions
+            async function loadAppointments() {
+                try {
+                    const response = await fetch('/api/appointments');
+                    if (response.ok) {
+                        const data = await response.json();
+                        displayAppointments(data.appointments);
+                    } else {
+                        document.getElementById('appointments-list').innerHTML = '<p>Error loading appointments</p>';
+                    }
+                } catch (error) {
+                    console.error('Error loading appointments:', error);
+                    document.getElementById('appointments-list').innerHTML = '<p>Error loading appointments</p>';
+                }
+            }
+            
+            function displayAppointments(appointments) {
+                const container = document.getElementById('appointments-list');
+                
+                if (appointments.length === 0) {
+                    container.innerHTML = `
+                        <div class="no-appointments">
+                            📅 No appointments found in transcripts
+                        </div>
+                    `;
+                    return;
+                }
+                
+                container.innerHTML = appointments.map(appointment => `
+                    <div class="appointment-item ${appointment.status === 'completed' ? 'completed' : ''}">
+                        <div class="appointment-header">
+                            <h4 class="appointment-title">${appointment.title}</h4>
+                            <span class="appointment-status ${appointment.status}">${appointment.status}</span>
+                        </div>
+                        ${appointment.appointment_time ? `<div class="appointment-time">🕒 ${appointment.appointment_time}</div>` : ''}
+                        ${appointment.appointment_date ? `<div class="appointment-time">📅 ${appointment.appointment_date}</div>` : ''}
+                        <div class="appointment-description">${appointment.description}</div>
+                        ${appointment.audio_filename ? `<div class="appointment-description">📁 From: ${appointment.audio_filename}</div>` : ''}
+                        <div class="appointment-actions">
+                            ${appointment.status === 'pending' ? `
+                                <button class="appointment-btn complete" onclick="completeAppointment(${appointment.id})">
+                                    ✅ Complete
+                                </button>
+                            ` : ''}
+                            <button class="appointment-btn delete" onclick="deleteAppointment(${appointment.id})">
+                                🗑️ Delete
+                            </button>
+                        </div>
+                    </div>
+                `).join('');
+            }
+            
+            async function completeAppointment(appointmentId) {
+                try {
+                    const response = await fetch(`/api/appointments/${appointmentId}/complete`, {
+                        method: 'POST'
+                    });
+                    
+                    if (response.ok) {
+                        alert('Appointment marked as completed!');
+                        loadAppointments();
+                    } else {
+                        alert('Error completing appointment');
+                    }
+                } catch (error) {
+                    alert(`Error completing appointment: ${error.message}`);
+                }
+            }
+            
+            async function deleteAppointment(appointmentId) {
+                if (!confirm('Are you sure you want to delete this appointment?')) {
+                    return;
+                }
+                
+                try {
+                    const response = await fetch(`/api/appointments/${appointmentId}`, {
+                        method: 'DELETE'
+                    });
+                    
+                    if (response.ok) {
+                        alert('Appointment deleted!');
+                        loadAppointments();
+                    } else {
+                        alert('Error deleting appointment');
+                    }
+                } catch (error) {
+                    alert(`Error deleting appointment: ${error.message}`);
                 }
             }
             
@@ -2269,18 +2726,6 @@ async def root():
                 return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
             }
             
-            async function scanDirectories() {
-                try {
-                    const response = await fetch('/api/scan', { method: 'POST' });
-                    const result = await response.json();
-                    alert(result.message);
-                    loadFiles();
-                } catch (error) {
-                    console.error('Error scanning directories:', error);
-                    alert('Error scanning directories');
-                }
-            }
-            
             async function checkDirectories() {
                 try {
                     const response = await fetch('/api/status');
@@ -2299,9 +2744,11 @@ async def root():
             }
             
             // Initialize
+            console.log('Initializing Smart Glasses Dock...');
             connectWebSocket();
             loadFiles();
             checkDirectories();
+            loadAppointments();
             
             // Refresh every 30 seconds
             setInterval(() => {
@@ -2327,14 +2774,41 @@ async def get_files():
                        transcription_status, language
                 FROM audio_files ORDER BY created_at DESC
             ''')
-            audio_files = [dict(row) for row in cursor.fetchall()]
+            audio_rows = cursor.fetchall()
+            audio_files = []
+            for row in audio_rows:
+                audio_files.append({
+                    "id": row[0],
+                    "filename": row[1],
+                    "file_path": row[2],
+                    "size": row[3],
+                    "duration": row[4],
+                    "created_at": row[5],
+                    "processed": row[6],
+                    "transcription_status": row[7],
+                    "language": row[8],
+                    "type": "audio"
+                })
             
             # Get document files
             cursor.execute('''
                 SELECT id, filename, file_path, size, width, height, created_at, processed
                 FROM documents ORDER BY created_at DESC
             ''')
-            document_files = [dict(row) for row in cursor.fetchall()]
+            document_rows = cursor.fetchall()
+            document_files = []
+            for row in document_rows:
+                document_files.append({
+                    "id": row[0],
+                    "filename": row[1],
+                    "file_path": row[2],
+                    "size": row[3],
+                    "width": row[4],
+                    "height": row[5],
+                    "created_at": row[6],
+                    "processed": row[7],
+                    "type": "document"
+                })
             
             # Combine and format files
             all_files = []
@@ -2620,40 +3094,11 @@ async def scan_directories():
                         cursor = conn.cursor()
                         cursor.execute('SELECT id FROM audio_files WHERE file_path = ?', (str(file_path),))
                         if not cursor.fetchone():
-                            # Check if it's a WAV file that needs conversion
+                            # Process WAV file (no conversion - keeping original)
                             if file_path.suffix.lower() == '.wav':
                                 logger.info(f"Detected new WAV file: {file_path}")
-                                
-                                # Convert WAV to MP3
-                                mp3_file = file_path.with_suffix('.mp3')
-                                conversion_success = False
-                                
-                                try:
-                                    if AUDIO_PROCESSING_AVAILABLE:
-                                        logger.info(f"Converting {file_path.name} to MP3...")
-                                        audio = AudioSegment.from_wav(str(file_path))
-                                        audio.export(str(mp3_file), format="mp3", bitrate="128k")
-                                        
-                                        if mp3_file.exists() and mp3_file.stat().st_size > 0:
-                                            logger.info(f"✅ MP3 conversion successful: {mp3_file.name}")
-                                            
-                                            # Delete original WAV file
-                                            file_path.unlink()
-                                            logger.info(f"🗑️ Deleted original WAV file: {file_path.name}")
-                                            
-                                            # Update file_path to point to MP3
-                                            file_path = mp3_file
-                                            conversion_success = True
-                                        else:
-                                            logger.warning(f"⚠️ MP3 conversion failed - keeping WAV file")
-                                    else:
-                                        logger.warning(f"⚠️ Audio processing not available - keeping WAV file")
-                                        
-                                except Exception as e:
-                                    logger.error(f"❌ MP3 conversion failed: {e}")
-                                    logger.info(f"📁 Keeping original WAV file: {file_path.name}")
                             
-                            # Add to database (either original WAV or converted MP3)
+                            # Add to database (keeping original WAV file)
                             cursor.execute('''
                                 INSERT INTO audio_files (filename, file_path, size, created_at)
                                 VALUES (?, ?, ?, ?)
@@ -2673,6 +3118,76 @@ async def scan_directories():
                         if not cursor.fetchone():
                             # Process document with CamScanner-like functionality
                             logger.info(f"Processing document: {file_path.name}")
+                            
+                            try:
+                                if DOCUMENT_PROCESSING_AVAILABLE:
+                                    result = document_processor.process_document(file_path)
+                                    
+                                    if result["success"]:
+                                        # Add original to documents table
+                                        cursor.execute('''
+                                            INSERT INTO documents (filename, file_path, size, width, height, created_at, processed)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                                        ''', (file_path.name, str(file_path), file_path.stat().st_size, 
+                                             result["original_size"][1], result["original_size"][0], datetime.now(), True))
+                                        
+                                        # Add scanned document to scanned_documents table
+                                        scanned_path = Path(result["processed_path"])
+                                        cursor.execute('''
+                                            INSERT INTO scanned_documents 
+                                            (original_filename, original_path, scanned_filename, scanned_path, 
+                                             original_size, scanned_size, corners_found, created_at)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                        ''', (file_path.name, str(file_path), scanned_path.name, str(scanned_path),
+                                             f"{result['original_size'][1]}x{result['original_size'][0]}",
+                                             f"{result['processed_size'][1]}x{result['processed_size'][0]}",
+                                             result["corners_found"], datetime.now()))
+                                        
+                                        conn.commit()
+                                        new_files += 1
+                                        logger.info(f"✅ Document processed and saved: {scanned_path.name}")
+                                    else:
+                                        logger.error(f"❌ Document processing failed: {result.get('error', 'Unknown error')}")
+                                        # Still add to database as unprocessed
+                                        cursor.execute('''
+                                            INSERT INTO documents (filename, file_path, size, created_at, processed)
+                                            VALUES (?, ?, ?, ?, ?)
+                                        ''', (file_path.name, str(file_path), file_path.stat().st_size, datetime.now(), False))
+                                        conn.commit()
+                                        new_files += 1
+                                        logger.info(f"Added unprocessed document: {file_path.name}")
+                                else:
+                                    logger.warning(f"⚠️ Document processing not available - adding as-is")
+                                    cursor.execute('''
+                                        INSERT INTO documents (filename, file_path, size, created_at, processed)
+                                        VALUES (?, ?, ?, ?, ?)
+                                    ''', (file_path.name, str(file_path), file_path.stat().st_size, datetime.now(), False))
+                                    conn.commit()
+                                    new_files += 1
+                                    logger.info(f"Added document (no processing): {file_path.name}")
+                                    
+                            except Exception as e:
+                                logger.error(f"❌ Error processing document {file_path.name}: {e}")
+                                # Add to database as unprocessed
+                                cursor.execute('''
+                                    INSERT INTO documents (filename, file_path, size, created_at, processed)
+                                    VALUES (?, ?, ?, ?, ?)
+                                ''', (file_path.name, str(file_path), file_path.stat().st_size, datetime.now(), False))
+                                conn.commit()
+                                new_files += 1
+                                logger.info(f"Added document (processing failed): {file_path.name}")
+        
+        # Scan documents directory (additional location)
+        if config.documents_dir.exists():
+            for file_path in config.documents_dir.glob("*"):
+                if file_path.is_file() and file_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.pdf']:
+                    # Check if file already exists in database
+                    with db_manager.get_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('SELECT id FROM documents WHERE file_path = ?', (str(file_path),))
+                        if not cursor.fetchone():
+                            # Process document with CamScanner-like functionality
+                            logger.info(f"Processing document from documents dir: {file_path.name}")
                             
                             try:
                                 if DOCUMENT_PROCESSING_AVAILABLE:
@@ -2846,6 +3361,34 @@ async def transcribe_audio_background(file_id: int, file_path: Path):
             ''', (result['text'], result['srt'], result['language'], file_id))
             conn.commit()
         
+        # Extract appointments from transcription
+        appointments = appointment_extractor.extract_appointments(result['text'], file_id)
+        logger.info(f"🔍 Appointment extraction result: {len(appointments)} appointments found")
+        if appointments:
+            logger.info(f"📅 Extracted {len(appointments)} appointments from transcription")
+            
+            # Save appointments to database
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                for appointment in appointments:
+                    cursor.execute('''
+                        INSERT INTO appointments (title, description, appointment_date, appointment_time, audio_file_id, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        appointment['title'],
+                        appointment['description'],
+                        appointment['date'],
+                        appointment['time'],
+                        appointment['audio_file_id'],
+                        appointment['status'],
+                        appointment['created_at']
+                    ))
+                conn.commit()
+            
+            await broadcast_message(f"📅 Found {len(appointments)} appointments in transcription")
+        else:
+            logger.info("📅 No appointments found in transcription")
+        
         logger.info(f"✅ Transcription completed for file ID {file_id}")
         await broadcast_message(f"Transcription completed for file ID {file_id}")
         
@@ -2862,7 +3405,126 @@ async def transcribe_audio_background(file_id: int, file_path: Path):
             ''', (file_id,))
             conn.commit()
         
-        await broadcast_message(f"Transcription failed for file ID {file_id}")
+@app.post("/api/test-appointment-extraction")
+async def test_appointment_extraction():
+    """Test appointment extraction with sample text"""
+    try:
+        test_text = "I have a doctor appointment tomorrow at 2 PM. Also, I need to schedule a meeting with John next Monday at 10 AM for the project discussion."
+        
+        # Extract appointments
+        appointments = appointment_extractor.extract_appointments(test_text, 999)  # Use fake file ID
+        
+        return {
+            "message": "Appointment extraction test completed",
+            "appointments": appointments,
+            "text_analyzed": test_text
+        }
+        
+    except Exception as e:
+        logger.error(f"Error testing appointment extraction: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/appointments")
+async def get_appointments():
+    """Get all appointments"""
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT a.id, a.title, a.description, a.appointment_date, a.appointment_time, 
+                       a.status, a.created_at, af.filename as audio_filename
+                FROM appointments a
+                LEFT JOIN audio_files af ON a.audio_file_id = af.id
+                ORDER BY a.appointment_date DESC, a.appointment_time DESC
+            ''')
+            appointments = []
+            for row in cursor.fetchall():
+                appointments.append({
+                    "id": row[0],
+                    "title": row[1],
+                    "description": row[2],
+                    "appointment_date": row[3],
+                    "appointment_time": row[4],
+                    "status": row[5],
+                    "created_at": row[6],
+                    "audio_filename": row[7]
+                })
+            
+            return {"appointments": appointments}
+            
+    except Exception as e:
+        logger.error(f"Error getting appointments: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/appointments/today")
+async def get_today_appointments():
+    """Get today's appointments"""
+    try:
+        from datetime import date
+        
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT a.id, a.title, a.description, a.appointment_date, a.appointment_time, 
+                       a.status, a.created_at, af.filename as audio_filename
+                FROM appointments a
+                LEFT JOIN audio_files af ON a.audio_file_id = af.id
+                WHERE a.appointment_date = ? OR a.appointment_date IS NULL
+                ORDER BY a.appointment_time ASC
+            ''', (date.today().isoformat(),))
+            
+            appointments = []
+            for row in cursor.fetchall():
+                appointments.append({
+                    "id": row[0],
+                    "title": row[1],
+                    "description": row[2],
+                    "appointment_date": row[3],
+                    "appointment_time": row[4],
+                    "status": row[5],
+                    "created_at": row[6],
+                    "audio_filename": row[7]
+                })
+            
+            return {"appointments": appointments}
+            
+    except Exception as e:
+        logger.error(f"Error getting today's appointments: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/appointments/{appointment_id}/complete")
+async def complete_appointment(appointment_id: int):
+    """Mark an appointment as completed"""
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE appointments 
+                SET status = 'completed'
+                WHERE id = ?
+            ''', (appointment_id,))
+            conn.commit()
+            
+            return {"message": "Appointment marked as completed"}
+            
+    except Exception as e:
+        logger.error(f"Error completing appointment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/appointments/{appointment_id}")
+async def delete_appointment(appointment_id: int):
+    """Delete an appointment"""
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM appointments WHERE id = ?', (appointment_id,))
+            conn.commit()
+            
+            return {"message": "Appointment deleted"}
+            
+    except Exception as e:
+        logger.error(f"Error deleting appointment: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/transcription/{file_id}")
 async def get_transcription(file_id: int):
@@ -3027,34 +3689,12 @@ async def upload_file(file: UploadFile = File(...)):
             content = await file.read()
             buffer.write(content)
         
-        # Process audio files
+        # Process audio files (no conversion - keeping original)
         final_file_path = original_file_path
         file_size = len(content)
         
-        if file_type == 'audio' and file.filename.lower().endswith('.wav'):
-            if audio_converter.available:
-                try:
-                    # Convert WAV to MP3
-                    mp3_path = audio_converter.convert_wav_to_mp3(original_file_path)
-                    
-                    # Get MP3 file size
-                    file_size = mp3_path.stat().st_size
-                    final_file_path = mp3_path
-                    
-                    # Get audio info
-                    audio_info = audio_converter.get_audio_info(mp3_path)
-                    
-                    # Remove original WAV file
-                    original_file_path.unlink()
-                    
-                    logger.info(f"Converted {file.filename} to MP3: {mp3_path.name}")
-                    
-                except Exception as e:
-                    logger.error(f"Failed to convert WAV to MP3: {e}")
-                    # Keep original file if conversion fails
-                    final_file_path = original_file_path
-            else:
-                logger.warning("Audio conversion not available - keeping original WAV file")
+        if file_type == 'audio':
+            logger.info(f"Uploaded audio file: {file.filename}")
         
         # Add to database
         with db_manager.get_connection() as conn:
@@ -3114,9 +3754,9 @@ if __name__ == "__main__":
     logger.info(f"Database: {config.db_path}")
     
     if audio_converter.available:
-        logger.info("✅ Audio conversion (WAV to MP3) is available")
+        logger.info("✅ Audio processing is available")
     else:
-        logger.warning("❌ Audio conversion not available - install pydub for WAV to MP3 conversion")
+        logger.info("ℹ️ Audio processing disabled - keeping WAV files only")
     
     if transcription_service.available:
         logger.info("✅ Audio transcription (Whisper) is available")
@@ -3135,9 +3775,9 @@ if __name__ == "__main__":
     print(f"📱 API Endpoint:  http://localhost:8007/api")
     print(f"🔌 WebSocket:     ws://localhost:8007/ws")
     if audio_converter.available:
-        print("🎵 Audio Conversion: WAV → MP3 (Automatic)")
+        print("🎵 Audio Processing: Available")
     else:
-        print("🎵 Audio Conversion: Not Available")
+        print("🎵 Audio Processing: WAV files only (no conversion)")
     if transcription_service.available:
         print("📝 Audio Transcription: Whisper (Automatic)")
     else:
