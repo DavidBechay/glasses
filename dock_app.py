@@ -19,7 +19,7 @@ import threading
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -460,6 +460,9 @@ class AppointmentExtractor:
             r'\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b',
             r'\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b',
             r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})\b',
+            r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?\b',
+            r'\b(\d{1,2})(?:st|nd|rd|th)?\s+of\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b',
+            r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*,\s*(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?\b',
             r'\b(tomorrow|today|yesterday)\b',
             r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b'
         ]
@@ -627,11 +630,25 @@ class AppointmentExtractor:
         """Extract date information from text"""
         import re
         
-        # Look for date patterns
+        # Look for date patterns in order of specificity
         for pattern in self.date_patterns:
             matches = re.findall(pattern, text, re.IGNORECASE)
             if matches:
-                return matches[0] if isinstance(matches[0], str) else ' '.join(matches[0])
+                match = matches[0]
+                if isinstance(match, tuple):
+                    # Handle complex patterns like "Monday, October 7th"
+                    if len(match) == 3:  # weekday, month, day
+                        return f"{match[0]}, {match[1]} {match[2]}"
+                    elif len(match) == 2:  # month, day or day, month
+                        # Check if it's "Xth of Month" format (day, month) or "Month Xth" format (month, day)
+                        if match[0].isdigit():  # day, month format
+                            return f"{match[1]} {match[0]}"
+                        else:  # month, day format
+                            return f"{match[0]} {match[1]}"
+                    else:
+                        return ' '.join(match)
+                else:
+                    return match
         
         return None
     
@@ -1274,6 +1291,123 @@ async def root():
                 padding: 40px 20px;
             }
             
+            /* Calendar Styles */
+            .calendar-container {
+                padding: 20px;
+            }
+            
+            .calendar-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 20px;
+                padding: 0 10px;
+            }
+            
+            .calendar-header h2 {
+                margin: 0;
+                color: #202124;
+                font-size: 24px;
+                font-weight: 500;
+            }
+            
+            .calendar-nav-btn {
+                background: #4285f4;
+                color: white;
+                border: none;
+                border-radius: 50%;
+                width: 40px;
+                height: 40px;
+                font-size: 18px;
+                cursor: pointer;
+                transition: background 0.2s ease;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            
+            .calendar-nav-btn:hover {
+                background: #3367d6;
+            }
+            
+            .calendar-grid {
+                display: grid;
+                grid-template-columns: repeat(7, 1fr);
+                gap: 1px;
+                background: #dadce0;
+                border-radius: 8px;
+                overflow: hidden;
+            }
+            
+            .calendar-day-header {
+                background: #f8f9fa;
+                padding: 12px 8px;
+                text-align: center;
+                font-weight: 500;
+                color: #5f6368;
+                font-size: 14px;
+            }
+            
+            .calendar-day {
+                background: white;
+                min-height: 100px;
+                padding: 8px;
+                border: none;
+                cursor: pointer;
+                transition: background 0.2s ease;
+                position: relative;
+            }
+            
+            .calendar-day:hover {
+                background: #f8f9fa;
+            }
+            
+            .calendar-day.other-month {
+                background: #f8f9fa;
+                color: #9aa0a6;
+            }
+            
+            .calendar-day.today {
+                background: #e8f0fe;
+                border: 2px solid #4285f4;
+            }
+            
+            .calendar-day.has-appointments {
+                background: #fff3cd;
+                border-left: 4px solid #ffc107;
+            }
+            
+            .calendar-day-number {
+                font-weight: 500;
+                margin-bottom: 4px;
+            }
+            
+            .calendar-appointment {
+                background: #4285f4;
+                color: white;
+                padding: 2px 6px;
+                border-radius: 4px;
+                font-size: 11px;
+                margin-bottom: 2px;
+                cursor: pointer;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            
+            .calendar-appointment:hover {
+                background: #3367d6;
+            }
+            
+            .calendar-appointment.completed {
+                background: #34a853;
+                opacity: 0.7;
+            }
+            
+            .calendar-appointment.completed:hover {
+                background: #2d8f47;
+            }
+            
             .search-result-preview {
                 color: #5f6368;
                 font-size: 12px;
@@ -1691,6 +1825,9 @@ async def root():
                         <button class="tab-btn" onclick="switchTab('scanned')" id="scanned-tab">
                             📄 Scanned Docs (<span id="scanned-count">0</span>)
                         </button>
+                        <button class="tab-btn" onclick="switchTab('calendar')" id="calendar-tab">
+                            📅 Calendar
+                        </button>
                     </div>
                 </div>
                 
@@ -1735,6 +1872,20 @@ async def root():
                         <div class="loading">
                             <div class="spinner"></div>
                             <div>Loading scanned documents...</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Calendar Tab -->
+                <div id="calendar-tab-content" class="tab-content">
+                    <div class="calendar-container">
+                        <div class="calendar-header">
+                            <button class="calendar-nav-btn" onclick="previousMonth()">‹</button>
+                            <h2 id="calendar-month-year">September 2025</h2>
+                            <button class="calendar-nav-btn" onclick="nextMonth()">›</button>
+                        </div>
+                        <div class="calendar-grid" id="calendar-grid">
+                            <!-- Calendar will be generated by JavaScript -->
                         </div>
                     </div>
                 </div>
@@ -2047,6 +2198,181 @@ async def root():
                 }
             }
             
+            // Calendar Functions
+            let currentCalendarDate = new Date();
+            let allAppointments = [];
+            
+            async function loadCalendar() {
+                try {
+                    // Load appointments
+                    const response = await fetch('/api/appointments');
+                    if (response.ok) {
+                        const data = await response.json();
+                        allAppointments = data.appointments;
+                        generateCalendar();
+                    }
+                } catch (error) {
+                    console.error('Error loading calendar:', error);
+                }
+            }
+            
+            function generateCalendar() {
+                const calendarGrid = document.getElementById('calendar-grid');
+                const monthYear = document.getElementById('calendar-month-year');
+                
+                // Update month/year header
+                const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
+                                  'July', 'August', 'September', 'October', 'November', 'December'];
+                monthYear.textContent = `${monthNames[currentCalendarDate.getMonth()]} ${currentCalendarDate.getFullYear()}`;
+                
+                // Clear calendar
+                calendarGrid.innerHTML = '';
+                
+                // Add day headers
+                const dayHeaders = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+                dayHeaders.forEach(day => {
+                    const dayHeader = document.createElement('div');
+                    dayHeader.className = 'calendar-day-header';
+                    dayHeader.textContent = day;
+                    calendarGrid.appendChild(dayHeader);
+                });
+                
+                // Get first day of month and number of days
+                const firstDay = new Date(currentCalendarDate.getFullYear(), currentCalendarDate.getMonth(), 1);
+                const lastDay = new Date(currentCalendarDate.getFullYear(), currentCalendarDate.getMonth() + 1, 0);
+                const daysInMonth = lastDay.getDate();
+                const startingDayOfWeek = firstDay.getDay();
+                
+                // Add empty cells for days before the first day of the month
+                for (let i = 0; i < startingDayOfWeek; i++) {
+                    const emptyDay = document.createElement('div');
+                    emptyDay.className = 'calendar-day other-month';
+                    calendarGrid.appendChild(emptyDay);
+                }
+                
+                // Add days of the month
+                for (let day = 1; day <= daysInMonth; day++) {
+                    const dayElement = document.createElement('div');
+                    dayElement.className = 'calendar-day';
+                    
+                    // Check if it's today
+                    const today = new Date();
+                    if (day === today.getDate() && 
+                        currentCalendarDate.getMonth() === today.getMonth() && 
+                        currentCalendarDate.getFullYear() === today.getFullYear()) {
+                        dayElement.classList.add('today');
+                    }
+                    
+                    // Add day number
+                    const dayNumber = document.createElement('div');
+                    dayNumber.className = 'calendar-day-number';
+                    dayNumber.textContent = day;
+                    dayElement.appendChild(dayNumber);
+                    
+                    // Add appointments for this day
+                    const dayAppointments = getAppointmentsForDay(day, currentCalendarDate.getMonth(), currentCalendarDate.getFullYear());
+                    if (dayAppointments.length > 0) {
+                        dayElement.classList.add('has-appointments');
+                        
+                        dayAppointments.forEach(appointment => {
+                            const appointmentElement = document.createElement('div');
+                            appointmentElement.className = `calendar-appointment ${appointment.status}`;
+                            appointmentElement.textContent = appointment.title;
+                            appointmentElement.title = appointment.description;
+                            appointmentElement.onclick = () => showAppointmentDetails(appointment);
+                            dayElement.appendChild(appointmentElement);
+                        });
+                    }
+                    
+                    calendarGrid.appendChild(dayElement);
+                }
+            }
+            
+            function getAppointmentsForDay(day, month, year) {
+                return allAppointments.filter(appointment => {
+                    // Parse appointment date/time
+                    const appointmentDate = parseAppointmentDate(appointment);
+                    if (!appointmentDate) return false;
+                    
+                    return appointmentDate.getDate() === day &&
+                           appointmentDate.getMonth() === month &&
+                           appointmentDate.getFullYear() === year;
+                });
+            }
+            
+            function parseAppointmentDate(appointment) {
+                // Try to parse the appointment date/time
+                let dateStr = appointment.appointment_date || appointment.appointment_time;
+                if (!dateStr) return null;
+                
+                // Handle different date formats
+                const today = new Date();
+                const currentYear = today.getFullYear();
+                
+                // Handle specific dates like "October 7th", "October 15th"
+                const specificDateMatch = dateStr.match(/(january|february|march|april|may|june|july|august|september|october|november|december)\\s+(\\d+)(?:st|nd|rd|th)?/i);
+                if (specificDateMatch) {
+                    const monthName = specificDateMatch[1].toLowerCase();
+                    const day = parseInt(specificDateMatch[2]);
+                    
+                    const monthMap = {
+                        'january': 0, 'february': 1, 'march': 2, 'april': 3,
+                        'may': 4, 'june': 5, 'july': 6, 'august': 7,
+                        'september': 8, 'october': 9, 'november': 10, 'december': 11
+                    };
+                    
+                    const month = monthMap[monthName];
+                    if (month !== undefined) {
+                        return new Date(currentYear, month, day);
+                    }
+                }
+                
+                // Handle "Tuesday", "Monday", etc. (only if no specific date found)
+                if (dateStr.toLowerCase().includes('tuesday')) {
+                    return getNextWeekday(2, today); // Tuesday = 2
+                } else if (dateStr.toLowerCase().includes('monday')) {
+                    return getNextWeekday(1, today); // Monday = 1
+                } else if (dateStr.toLowerCase().includes('wednesday')) {
+                    return getNextWeekday(3, today); // Wednesday = 3
+                } else if (dateStr.toLowerCase().includes('thursday')) {
+                    return getNextWeekday(4, today); // Thursday = 4
+                } else if (dateStr.toLowerCase().includes('friday')) {
+                    return getNextWeekday(5, today); // Friday = 5
+                } else if (dateStr.toLowerCase().includes('saturday')) {
+                    return getNextWeekday(6, today); // Saturday = 6
+                } else if (dateStr.toLowerCase().includes('sunday')) {
+                    return getNextWeekday(0, today); // Sunday = 0
+                }
+                
+                // Handle "October" without specific day (fallback)
+                if (dateStr.toLowerCase().includes('october')) {
+                    return new Date(currentYear, 9, 1); // Default to October 1st
+                }
+                
+                return null;
+            }
+            
+            function getNextWeekday(weekday, fromDate) {
+                const daysUntilWeekday = (weekday - fromDate.getDay() + 7) % 7;
+                const nextWeekday = new Date(fromDate);
+                nextWeekday.setDate(fromDate.getDate() + (daysUntilWeekday === 0 ? 7 : daysUntilWeekday));
+                return nextWeekday;
+            }
+            
+            function previousMonth() {
+                currentCalendarDate.setMonth(currentCalendarDate.getMonth() - 1);
+                generateCalendar();
+            }
+            
+            function nextMonth() {
+                currentCalendarDate.setMonth(currentCalendarDate.getMonth() + 1);
+                generateCalendar();
+            }
+            
+            function showAppointmentDetails(appointment) {
+                alert(`Appointment: ${appointment.title}\n\nDescription: ${appointment.description}\n\nStatus: ${appointment.status}`);
+            }
+            
             function switchTab(tabName) {
                 currentTab = tabName;
                 
@@ -2079,6 +2405,9 @@ async def root():
                         files = allFiles.filter(f => f.type === 'scanned');
                         gridId = 'scanned-files-grid';
                         break;
+                    case 'calendar':
+                        loadCalendar();
+                        return;
                 }
                 
                 const grid = document.getElementById(gridId);
@@ -3406,10 +3735,11 @@ async def transcribe_audio_background(file_id: int, file_path: Path):
             conn.commit()
         
 @app.post("/api/test-appointment-extraction")
-async def test_appointment_extraction():
-    """Test appointment extraction with sample text"""
+async def test_appointment_extraction(request: Request):
+    """Test appointment extraction with provided text"""
     try:
-        test_text = "I have a doctor appointment tomorrow at 2 PM. Also, I need to schedule a meeting with John next Monday at 10 AM for the project discussion."
+        data = await request.json()
+        test_text = data.get("text", "I have a doctor appointment tomorrow at 2 PM. Also, I need to schedule a meeting with John next Monday at 10 AM for the project discussion.")
         
         # Extract appointments
         appointments = appointment_extractor.extract_appointments(test_text, 999)  # Use fake file ID
