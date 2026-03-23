@@ -46,12 +46,6 @@ prototype/
     └── documents/          # Captured documents
 ```
 
-## 🔧 Requirements
-
-- Python 3.7+
-- Webcam
-- Microphone
-- Modern web browser
 
 ## 📦 Dependencies
 
@@ -73,7 +67,7 @@ prototype/
 
 - **Document Detection**: Advanced OpenCV with adaptive thresholding, morphological operations, and rectangularity analysis
 - **Voice Detection**: RMS + Zero-crossing rate analysis
-- **Web Interface**: Modern HTML5/CSS3/JavaScript with WebSocket communication
+- **Web Interface**
 - **Real-time Processing**: 30 FPS camera processing with 0.5s detection intervals
 - **Auto-capture Delay**: 3 seconds between captures to prevent spam
 
